@@ -225,6 +225,13 @@ def check_once() -> date | None:
     if not os.environ.get("SHOW_BROWSER"):
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
+        # Linux server hardening: no GPU/X-display, no sandbox (needed
+        # when running as root / in most containers), and use /tmp
+        # instead of /dev/shm (often tiny on VPS/containers and causes
+        # Chrome to crash mid-run otherwise).
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
     driver = webdriver.Chrome(options=options)
     wait = WebDriverWait(driver, 20)
 
