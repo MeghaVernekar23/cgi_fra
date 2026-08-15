@@ -146,7 +146,7 @@ def send_telegram_message(site: Site, text: str, html: bool = False) -> None:
             print(f"[{site.name}] Telegram send to {chat_id} failed: {resp.status_code} {resp.text}")
 
 
-PAGE_TIMEOUT_MS = 20_000
+PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "45000"))
 
 
 def click_checkbox_and_proceed(page):
@@ -171,7 +171,11 @@ def click_checkbox_and_proceed(page):
 
 def fill_booking_form(page, site: Site):
     """Pages 1-3: agreement, state, appointment type/category/service."""
-    page.goto(site.url, timeout=PAGE_TIMEOUT_MS)
+    # "domcontentloaded" instead of the default "load": we only need the
+    # DOM ready (we explicitly wait for specific elements afterward
+    # anyway), and "load" also waits on every image/font/tracker script,
+    # which was timing out on a slow server connection to a slow site.
+    page.goto(site.url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
 
     # --- Page 1: agree checkbox + proceed ---
     click_checkbox_and_proceed(page)
@@ -321,15 +325,17 @@ def check_with_retry(site: Site) -> date | None:
     raise last_error
 
 
-# Check history per site, for heartbeat reporting — every check since
-# the last heartbeat, not just the latest. Each entry:
-# {"stamp": <local-time str>, "result": <human-readable str>, "ok": bool}.
+# Check history per site, for heartbeat reporting — every *successful*
+# check since the last heartbeat, not just the latest. Failed checks are
+# deliberately excluded (see run_check_for_site) so the heartbeat stays
+# short and readable instead of dumping raw Playwright errors. Each
+# entry: {"stamp": <local-time str>, "result": <human-readable str>}.
 # Cleared after each heartbeat fires (see maybe_send_heartbeat).
 CHECK_HISTORY: dict[str, list[dict]] = {site.name: [] for site in SITES}
 
 
-def _record_check(site: Site, stamp: str, result: str, ok: bool) -> None:
-    CHECK_HISTORY.setdefault(site.name, []).append({"stamp": stamp, "result": result, "ok": ok})
+def _record_check(site: Site, stamp: str, result: str) -> None:
+    CHECK_HISTORY.setdefault(site.name, []).append({"stamp": stamp, "result": result})
 
 
 def run_check_for_site(site: Site) -> None:
@@ -341,19 +347,23 @@ def run_check_for_site(site: Site) -> None:
         next_date = check_with_retry(site)
     except Exception as e:
         stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
+        # Full console log (Playwright errors are multi-line and verbose —
+        # fine for local debugging).
         print(f"[{stamp}] [{site.name}] Check failed after {RETRY_ATTEMPTS} attempts: {e}")
-        _record_check(site, stamp, f"check failed ({e})", ok=False)
+        # Heartbeat, though, should skip failed checks entirely (per user
+        # request) rather than show the raw error — so we don't record
+        # this in CHECK_HISTORY at all.
         return
 
     stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
 
     if next_date is None:
         print(f"[{stamp}] [{site.name}] No available appointment date found in the browsable range.")
-        _record_check(site, stamp, "no available date found", ok=True)
+        _record_check(site, stamp, "no available date found")
         return
 
     print(f"[{stamp}] [{site.name}] Next available appointment date: {next_date.strftime('%d %B %Y')}")
-    _record_check(site, stamp, next_date.strftime("%d %B %Y"), ok=True)
+    _record_check(site, stamp, next_date.strftime("%d %B %Y"))
 
     if next_date <= CUTOFF_DATE:
         telegram_msg = (
@@ -408,19 +418,19 @@ def _escape_html(text: str) -> str:
 
 def _format_heartbeat(site: Site, stamp: str) -> str:
     """HTML-formatted heartbeat body for one site: bold header + a
-    bullet list of every check recorded since the last heartbeat
-    (time only, CHECK_HISTORY stamps already carry the date via ISO)."""
+    bullet list of every successful check since the last heartbeat
+    (time only, CHECK_HISTORY stamps already carry the date via ISO).
+    Failed checks are intentionally excluded — see run_check_for_site."""
     checks = CHECK_HISTORY.get(site.name, [])
     lines = [f"🟢 <b>{_escape_html(site.name)}</b> watcher alive — {_escape_html(stamp)}"]
 
     if not checks:
-        lines.append("No checks completed since last heartbeat.")
+        lines.append("No successful checks this period.")
     else:
         lines.append(f"<b>{len(checks)} check(s) this period:</b>")
         for c in checks:
             time_only = c["stamp"].split("T", 1)[1] if "T" in c["stamp"] else c["stamp"]
-            icon = "✅" if c["ok"] else "⚠️"
-            lines.append(f"{icon} <code>{_escape_html(time_only)}</code> — {_escape_html(c['result'])}")
+            lines.append(f"✅ <code>{_escape_html(time_only)}</code> — {_escape_html(c['result'])}")
 
     return "\n".join(lines)
 
