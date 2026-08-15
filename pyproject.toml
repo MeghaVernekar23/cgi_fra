@@ -5,8 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "playwright>=1.62.0",
     "python-dotenv>=1.2.2",
     "requests>=2.34.2",
-    "selenium>=4.47.0",
     "tzdata>=2026.3",
 ]

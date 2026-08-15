@@ -1,8 +1,14 @@
 """
-Selenium script: open CGI Frankfurt visa appointment site, fill the
+Playwright script: open CGI Frankfurt visa appointment site, fill the
 booking form (state, appointment type, service), read the next available
 appointment date from the datepicker, and Telegram-alert if a date is
 open on or before CUTOFF_DATE.
+
+Uses Playwright (not Selenium) because it bundles its own tested
+Chromium build — no chromedriver-vs-browser version matching, no snap
+package interference, much more reliable on headless Linux servers.
+First-time setup after `uv sync` needs the browser binary once:
+    uv run playwright install chromium --with-deps
 
 Runs forever by default, checking every 5 minutes (POLL_SECONDS env var
 to change). Meant to run as a long-lived process on a server:
@@ -35,11 +41,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 load_dotenv()
 
@@ -90,91 +92,83 @@ def send_telegram_message(text: str) -> None:
         print(f"Telegram send failed: {resp.status_code} {resp.text}")
 
 
-def click_checkbox_and_proceed(driver, wait):
-    checkbox = wait.until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox']"))
-    )
-    if not checkbox.is_selected():
+PAGE_TIMEOUT_MS = 20_000
+
+
+def click_checkbox_and_proceed(page):
+    checkbox = page.locator("input[type='checkbox']").first
+    checkbox.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    if not checkbox.is_checked():
         checkbox.click()  # real click fires the page's change listener
 
-    proceed_btn = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, "//button[contains(translate(., 'PROCEED', 'proceed'), 'proceed')] "
-                       "| //input[@type='submit' and contains(translate(@value,'PROCEED','proceed'),'proceed')]")
-        )
-    )
+    proceed_btn = page.locator(
+        "button:has-text('PROCEED'), button:has-text('Proceed'), "
+        "input[type='submit'][value*='PROCEED' i]"
+    ).first
+    proceed_btn.wait_for(state="attached", timeout=PAGE_TIMEOUT_MS)
     # Button may start disabled until validation JS re-enables it.
-    wait.until(lambda d: proceed_btn.get_attribute("disabled") is None)
+    page.wait_for_function(
+        "(el) => el.disabled === false || el.getAttribute('disabled') === null",
+        arg=proceed_btn.element_handle(),
+        timeout=PAGE_TIMEOUT_MS,
+    )
     proceed_btn.click()
 
 
-def fill_booking_form(driver, wait):
+def fill_booking_form(page):
     """Pages 1-3: agreement, state, appointment type/category/service."""
-    driver.get(URL)
+    page.goto(URL, timeout=PAGE_TIMEOUT_MS)
 
     # --- Page 1: agree checkbox + proceed ---
-    click_checkbox_and_proceed(driver, wait)
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    click_checkbox_and_proceed(page)
+    page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
 
     # --- Page 2: select state, checkbox, proceed ---
-    state_select_el = wait.until(EC.presence_of_element_located((By.ID, "dropdown")))
-    Select(state_select_el).select_by_value(STATE)
-    # dropdown has no 'selected' HTML attr, so <select>.value won't
-    # auto-fire; trigger the page's change listener explicitly.
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-        state_select_el,
-    )
-    click_checkbox_and_proceed(driver, wait)
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    state_select = page.locator("#dropdown")
+    state_select.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    state_select.select_option(value=STATE)
+    # dropdown has no 'selected' HTML attr, so .select_option()'s implicit
+    # change event may not be enough for the page's own listener; fire it
+    # explicitly to be safe.
+    state_select.dispatch_event("change")
+    click_checkbox_and_proceed(page)
+    page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
 
     # --- Page 3: appointment type, service category, service ---
 
     # 1. Radio "Individual" (name=apt_group, value=1)
-    individual_radio = wait.until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='apt_group'][value='1']"))
-    )
+    individual_radio = page.locator("input[name='apt_group'][value='1']")
+    individual_radio.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
     individual_radio.click()
 
     # 2. Service Category -> OCI Services (value=1)
-    category_select_el = wait.until(EC.presence_of_element_located((By.ID, "category")))
-    Select(category_select_el).select_by_value("1")
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));"
-        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-        category_select_el,
-    )
+    category_select = page.locator("#category")
+    category_select.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    category_select.select_option(value="1")
+    category_select.dispatch_event("change")
+    category_select.dispatch_event("input")
 
     # 3. Wait for the AJAX-populated "Select Service" dropdown to appear
     #    (the #service element itself doesn't exist until the AJAX
     #    response injects it), then wait for it to have real options,
     #    then choose Fresh OCI.
-    def service_dropdown_ready(d):
-        els = d.find_elements(By.ID, "service")
-        if not els:
-            return False
-        opts = els[0].find_elements(By.TAG_NAME, "option")
-        return els[0] if len(opts) > 1 else False
-
-    service_select_el = wait.until(service_dropdown_ready)
-    service_select = Select(service_select_el)
-    matched = False
-    for option in service_select.options:
-        if "fresh oci" in option.text.strip().lower():
-            service_select.select_by_visible_text(option.text)
-            matched = True
-            break
-    if not matched:
-        available = [o.text for o in service_select.options]
-        raise RuntimeError(f"'Fresh OCI' not found in service options: {available}")
-
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-        service_select_el,
+    service_select = page.locator("#service")
+    service_select.wait_for(state="attached", timeout=PAGE_TIMEOUT_MS)
+    page.wait_for_function(
+        "(el) => el.options.length > 1",
+        arg=service_select.element_handle(),
+        timeout=PAGE_TIMEOUT_MS,
     )
 
+    options = service_select.locator("option").all_text_contents()
+    matched = next((o for o in options if "fresh oci" in o.strip().lower()), None)
+    if not matched:
+        raise RuntimeError(f"'Fresh OCI' not found in service options: {options}")
+    service_select.select_option(label=matched)
+    service_select.dispatch_event("change")
 
-def find_next_available_date(driver, wait) -> date | None:
+
+def find_next_available_date(page) -> date | None:
     """Open the appointment datepicker and return the first available
     (non-struck) date, or None if nothing is open in the browsable range.
 
@@ -182,64 +176,65 @@ def find_next_available_date(driver, wait) -> date | None:
     (class 'booked-dates' or 'weekends'); available days render as a
     clickable <a> inside the <td>. Site allows browsing ~90 days ahead.
     """
-    date_input = wait.until(EC.element_to_be_clickable((By.ID, "appmnt_date")))
+    date_input = page.locator("#appmnt_date")
+    date_input.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
     date_input.click()
 
-    wait.until(EC.visibility_of_element_located((By.ID, "ui-datepicker-div")))
+    picker = page.locator("#ui-datepicker-div")
+    picker.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
 
     for _ in range(4):  # current month + a few months ahead, bounded safety
-        wait.until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-calendar"))
-        )
-        links = driver.find_elements(
-            By.CSS_SELECTOR,
-            "#ui-datepicker-div .ui-datepicker-calendar td:not(.ui-datepicker-unselectable) a",
-        )
-        if links:
-            first_available = links[0]
-            day_text = first_available.text.strip()
-            month_name = Select(
-                driver.find_element(By.CSS_SELECTOR, "#ui-datepicker-div select.ui-datepicker-month")
-            ).first_selected_option.text
-            year_name = Select(
-                driver.find_element(By.CSS_SELECTOR, "#ui-datepicker-div select.ui-datepicker-year")
-            ).first_selected_option.text
-            fmt = "%d %B %Y" if len(month_name) > 3 else "%d %b %Y"
-            parsed = datetime.strptime(f"{day_text} {month_name} {year_name}", fmt).date()
+        calendar = picker.locator(".ui-datepicker-calendar")
+        calendar.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+
+        available_links = calendar.locator("td:not(.ui-datepicker-unselectable) a")
+        if available_links.count() > 0:
+            first_available = available_links.first
+            day_text = first_available.inner_text().strip()
+            # changeMonth/changeYear render these as <select> dropdowns;
+            # read the selected option's text directly.
+            month_text = picker.locator("select.ui-datepicker-month").evaluate(
+                "el => el.options[el.selectedIndex].text"
+            )
+            year_text = picker.locator("select.ui-datepicker-year").evaluate(
+                "el => el.options[el.selectedIndex].text"
+            )
+            fmt = "%d %B %Y" if len(month_text) > 3 else "%d %b %Y"
+            parsed = datetime.strptime(f"{day_text} {month_text} {year_text}", fmt).date()
+            first_available.click()
             return parsed
 
         # No available date this month -> go to next month
-        next_btn = driver.find_element(By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-next")
-        if "ui-state-disabled" in next_btn.get_attribute("class"):
+        next_btn = picker.locator(".ui-datepicker-next")
+        next_btn_classes = next_btn.get_attribute("class") or ""
+        if "ui-state-disabled" in next_btn_classes:
             break  # can't page further forward
-        stale_marker = driver.find_element(By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-calendar")
         next_btn.click()
-        wait.until(EC.staleness_of(stale_marker))
+        picker.locator(".ui-datepicker-calendar").wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
 
     return None
 
 
 def check_once() -> date | None:
     """Run the full flow once. Returns the next available date, if any."""
-    options = Options()
-    if not os.environ.get("SHOW_BROWSER"):
-        options.add_argument("--headless=new")
-        options.add_argument("--window-size=1920,1080")
-        # Linux server hardening: no GPU/X-display, no sandbox (needed
-        # when running as root / in most containers), and use /tmp
-        # instead of /dev/shm (often tiny on VPS/containers and causes
-        # Chrome to crash mid-run otherwise).
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 20)
+    headless = not os.environ.get("SHOW_BROWSER")
 
-    try:
-        fill_booking_form(driver, wait)
-        return find_next_available_date(driver, wait)
-    finally:
-        driver.quit()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            # Linux server hardening: no sandbox (needed running as root /
+            # in most containers) and use /tmp instead of /dev/shm (often
+            # tiny on VPS/containers and causes crashes mid-run otherwise).
+            args=["--no-sandbox", "--disable-dev-shm-usage"] if headless else [],
+        )
+        try:
+            context = browser.new_context(viewport={"width": 1920, "height": 1080})
+            page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT_MS)
+            fill_booking_form(page)
+            return find_next_available_date(page)
+        finally:
+            browser.close()
 
 
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
