@@ -128,14 +128,18 @@ def send_email(subject: str, body: str) -> None:
         print(f"Email send failed: {e}")
 
 
-def send_telegram_message(site: Site, text: str) -> None:
+def send_telegram_message(site: Site, text: str, html: bool = False) -> None:
     if not site.telegram_bot or not site.telegram_chat_ids:
         print(f"[{site.name}] Telegram bot/chat id(s) not set in .env — skipping alert.")
         return
+    payload = {"chat_id": None, "text": text}
+    if html:
+        payload["parse_mode"] = "HTML"
     for chat_id in site.telegram_chat_ids:
+        payload["chat_id"] = chat_id
         resp = requests.post(
             f"https://api.telegram.org/bot{site.telegram_bot}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json=payload,
             timeout=15,
         )
         if not resp.ok:
@@ -317,6 +321,17 @@ def check_with_retry(site: Site) -> date | None:
     raise last_error
 
 
+# Check history per site, for heartbeat reporting — every check since
+# the last heartbeat, not just the latest. Each entry:
+# {"stamp": <local-time str>, "result": <human-readable str>, "ok": bool}.
+# Cleared after each heartbeat fires (see maybe_send_heartbeat).
+CHECK_HISTORY: dict[str, list[dict]] = {site.name: [] for site in SITES}
+
+
+def _record_check(site: Site, stamp: str, result: str, ok: bool) -> None:
+    CHECK_HISTORY.setdefault(site.name, []).append({"stamp": stamp, "result": result, "ok": ok})
+
+
 def run_check_for_site(site: Site) -> None:
     """Single check-and-alert cycle for one site. Never raises — logs and
     swallows errors so a bad run doesn't kill the surrounding loop or the
@@ -325,29 +340,39 @@ def run_check_for_site(site: Site) -> None:
     try:
         next_date = check_with_retry(site)
     except Exception as e:
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] [{site.name}] "
-              f"Check failed after {RETRY_ATTEMPTS} attempts: {e}")
+        stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
+        print(f"[{stamp}] [{site.name}] Check failed after {RETRY_ATTEMPTS} attempts: {e}")
+        _record_check(site, stamp, f"check failed ({e})", ok=False)
         return
 
-    stamp = datetime.now().isoformat(timespec="seconds")
+    stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
 
     if next_date is None:
         print(f"[{stamp}] [{site.name}] No available appointment date found in the browsable range.")
+        _record_check(site, stamp, "no available date found", ok=True)
         return
 
     print(f"[{stamp}] [{site.name}] Next available appointment date: {next_date.strftime('%d %B %Y')}")
+    _record_check(site, stamp, next_date.strftime("%d %B %Y"), ok=True)
 
     if next_date <= CUTOFF_DATE:
-        msg = (
+        telegram_msg = (
+            f"🎉 <b>APPOINTMENT AVAILABLE!</b> 🎉\n\n"
+            f"📍 <b>{_escape_html(site.name)}</b>\n"
+            f"📅 <b>{_escape_html(next_date.strftime('%d %B %Y'))}</b>\n"
+            f"⏰ On or before cutoff ({_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))})\n\n"
+            f"👉 <a href=\"{site.url}\">Book now</a> — slots fill fast!"
+        )
+        send_telegram_message(site, telegram_msg, html=True)
+        print(f"[{stamp}] [{site.name}] Telegram alert sent.")
+        email_msg = (
             f"{site.name} OCI appointment available: "
             f"{next_date.strftime('%d %B %Y')} (on/before {CUTOFF_DATE.strftime('%d %B %Y')})\n"
             f"Book now: {site.url}"
         )
-        send_telegram_message(site, msg)
-        print(f"[{stamp}] [{site.name}] Telegram alert sent.")
         send_email(
             subject=f"{site.name} OCI appointment available — {next_date.strftime('%d %B %Y')}",
-            body=msg,
+            body=email_msg,
         )
         print(f"[{stamp}] [{site.name}] Email alert sent.")
     else:
@@ -377,17 +402,43 @@ def seconds_until_blackout_ends() -> float:
 HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", str(60 * 60)))  # 1 hour
 
 
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _format_heartbeat(site: Site, stamp: str) -> str:
+    """HTML-formatted heartbeat body for one site: bold header + a
+    bullet list of every check recorded since the last heartbeat
+    (time only, CHECK_HISTORY stamps already carry the date via ISO)."""
+    checks = CHECK_HISTORY.get(site.name, [])
+    lines = [f"🟢 <b>{_escape_html(site.name)}</b> watcher alive — {_escape_html(stamp)}"]
+
+    if not checks:
+        lines.append("No checks completed since last heartbeat.")
+    else:
+        lines.append(f"<b>{len(checks)} check(s) this period:</b>")
+        for c in checks:
+            time_only = c["stamp"].split("T", 1)[1] if "T" in c["stamp"] else c["stamp"]
+            icon = "✅" if c["ok"] else "⚠️"
+            lines.append(f"{icon} <code>{_escape_html(time_only)}</code> — {_escape_html(c['result'])}")
+
+    return "\n".join(lines)
+
+
 def maybe_send_heartbeat(last_heartbeat: float) -> float:
     """Send a Telegram 'still alive' ping (per site) if HEARTBEAT_SECONDS
-    have elapsed since the last one. Returns the (possibly updated)
-    last-sent timestamp (time.monotonic())."""
+    have elapsed since the last one. Lists every check recorded for that
+    site since the previous heartbeat (HTML-formatted), then clears the
+    history for the next period. Returns the (possibly updated) last-sent
+    timestamp (time.monotonic())."""
     now = time.monotonic()
     if now - last_heartbeat < HEARTBEAT_SECONDS:
         return last_heartbeat
 
     stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
     for site in SITES:
-        send_telegram_message(site, f"{site.name} appointment watcher is alive and checking. ({stamp})")
+        send_telegram_message(site, _format_heartbeat(site, stamp), html=True)
+        CHECK_HISTORY[site.name] = []  # reset for the next period
     print(f"[{stamp}] Heartbeat sent.")
     return now
 
