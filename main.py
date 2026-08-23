@@ -11,7 +11,7 @@ package interference, much more reliable on headless Linux servers.
 First-time setup after `uv sync` needs the browser binary once:
     uv run playwright install chromium --with-deps
 
-Runs forever by default, checking every 5 minutes (POLL_SECONDS env var
+Runs forever by default, checking every 3 minutes (POLL_SECONDS env var
 to change). Meant to run as a long-lived process on a server:
 
     uv run main.py
@@ -26,7 +26,7 @@ Show the browser window instead of headless (debugging):
 
 If a site fails to load / times out / behaves unexpectedly, that site is
 NOT retried within the same cycle by default (RETRY_ATTEMPTS=1) — it's
-logged and skipped, and the next POLL_SECONDS tick (default 5 min) picks
+logged and skipped, and the next POLL_SECONDS tick (default 3 min) picks
 it back up naturally. Set RETRY_ATTEMPTS higher to retry in-cycle first,
 waiting RETRY_DELAY_SECONDS (default 60s) between tries.
 
@@ -49,7 +49,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 load_dotenv()
 
-CUTOFF_DATE = date(2026, 10, 21)
+CUTOFF_DATE = date(2026, 9, 29)
 
 # Don't hit the sites during this local window — likely the platform's own
 # maintenance window, so it's especially flaky/likely to be down then.
@@ -87,6 +87,9 @@ class Site:
     state_value: str  # <select id="dropdown"> option value to pick
     telegram_bot: str | None
     telegram_chat_ids: list[str] = field(default_factory=list)
+    # After this local (CET) date, the watcher stops actively checking
+    # this site at all (skipped every cycle) — None means no expiry.
+    stop_checking_after: date | None = None
 
 
 SITES = [
@@ -96,6 +99,7 @@ SITES = [
         state_value="North Rhine-Westphalia",  # matches the site's spelling exactly
         telegram_bot=os.environ.get("TELEGRAM_BOT"),
         telegram_chat_ids=_parse_chat_ids(os.environ.get("TELEGRAM_CHAT_ID")),
+        stop_checking_after=date(2026, 9, 17),
     ),
     Site(
         name="Embassy Berlin",
@@ -107,14 +111,16 @@ SITES = [
         state_value="Berlin",
         telegram_bot=os.environ.get("TELEGRAM_BERLIN_BOT"),
         telegram_chat_ids=_parse_chat_ids(os.environ.get("TELEGRAM_BERLIN_BOT_USERS")),
+        stop_checking_after=date(2026, 9, 5),
     ),
 ]
 
 
-def send_email(subject: str, body: str) -> None:
+def send_email(subject: str, body: str) -> bool:
+    """Returns True only if the email was actually sent."""
     if not GMAIL_USERNAME or not GMAIL_APP_PASSWORD or not RECEIVER_EMAIL:
         print("GMAIL_USERNAME / GMAIL_APP_PASSWORD / RECEIVER_EMAIL not set in .env — skipping email.")
-        return
+        return False
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = GMAIL_USERNAME
@@ -124,17 +130,24 @@ def send_email(subject: str, body: str) -> None:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
             smtp.login(GMAIL_USERNAME, GMAIL_APP_PASSWORD)
             smtp.send_message(msg)
+        return True
     except Exception as e:
         print(f"Email send failed: {e}")
+        return False
 
 
-def send_telegram_message(site: Site, text: str, html: bool = False) -> None:
+def send_telegram_message(site: Site, text: str, html: bool = False) -> bool:
+    """Returns True only if the message was sent to every configured
+    chat id for this site (partial failure counts as failure, so a
+    caller tracking "already alerted" won't skip a retry that some
+    recipients still need)."""
     if not site.telegram_bot or not site.telegram_chat_ids:
         print(f"[{site.name}] Telegram bot/chat id(s) not set in .env — skipping alert.")
-        return
+        return False
     payload = {"chat_id": None, "text": text}
     if html:
         payload["parse_mode"] = "HTML"
+    all_ok = True
     for chat_id in site.telegram_chat_ids:
         payload["chat_id"] = chat_id
         resp = requests.post(
@@ -144,6 +157,8 @@ def send_telegram_message(site: Site, text: str, html: bool = False) -> None:
         )
         if not resp.ok:
             print(f"[{site.name}] Telegram send to {chat_id} failed: {resp.status_code} {resp.text}")
+            all_ok = False
+    return all_ok
 
 
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "45000"))
@@ -234,13 +249,17 @@ def fill_booking_form(page, site: Site):
     service_select.dispatch_event("change")
 
 
-def find_next_available_date(page) -> date | None:
-    """Open the appointment datepicker and return the first available
-    (non-struck) date, or None if nothing is open in the browsable range.
+def find_available_dates(page) -> list[date]:
+    """Open the appointment datepicker and return every available
+    (non-struck) date found, in order, across the browsable range.
 
     jQuery UI datepicker marks unavailable days as disabled <span> cells
     (class 'booked-dates' or 'weekends'); available days render as a
     clickable <a> inside the <td>. Site allows browsing ~90 days ahead.
+
+    Doesn't click any date — this is a read-only scan (previously the
+    first match was clicked to fill the field, but now that we report
+    every available date, there's no single "the" date to select).
     """
     date_input = page.locator("#appmnt_date")
     date_input.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
@@ -249,28 +268,30 @@ def find_next_available_date(page) -> date | None:
     picker = page.locator("#ui-datepicker-div")
     picker.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
 
+    found: list[date] = []
+
     for _ in range(4):  # current month + a few months ahead, bounded safety
         calendar = picker.locator(".ui-datepicker-calendar")
         calendar.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
 
-        available_links = calendar.locator("td:not(.ui-datepicker-unselectable) a")
-        if available_links.count() > 0:
-            first_available = available_links.first
-            day_text = first_available.inner_text().strip()
-            # changeMonth/changeYear render these as <select> dropdowns;
-            # read the selected option's text directly.
-            month_text = picker.locator("select.ui-datepicker-month").evaluate(
-                "el => el.options[el.selectedIndex].text"
-            )
-            year_text = picker.locator("select.ui-datepicker-year").evaluate(
-                "el => el.options[el.selectedIndex].text"
-            )
-            fmt = "%d %B %Y" if len(month_text) > 3 else "%d %b %Y"
-            parsed = datetime.strptime(f"{day_text} {month_text} {year_text}", fmt).date()
-            first_available.click()
-            return parsed
+        # changeMonth/changeYear render these as <select> dropdowns;
+        # read the selected option's text directly.
+        month_text = picker.locator("select.ui-datepicker-month").evaluate(
+            "el => el.options[el.selectedIndex].text"
+        )
+        year_text = picker.locator("select.ui-datepicker-year").evaluate(
+            "el => el.options[el.selectedIndex].text"
+        )
+        fmt = "%d %B %Y" if len(month_text) > 3 else "%d %b %Y"
 
-        # No available date this month -> go to next month
+        available_links = calendar.locator("td:not(.ui-datepicker-unselectable) a")
+        for day_text in available_links.all_inner_texts():
+            parsed = datetime.strptime(f"{day_text.strip()} {month_text} {year_text}", fmt).date()
+            found.append(parsed)
+
+        # Move to next month regardless of whether this one had hits, so
+        # we keep scanning the full browsable range instead of stopping
+        # at the first month with an opening.
         next_btn = picker.locator(".ui-datepicker-next")
         next_btn_classes = next_btn.get_attribute("class") or ""
         if "ui-state-disabled" in next_btn_classes:
@@ -278,11 +299,12 @@ def find_next_available_date(page) -> date | None:
         next_btn.click()
         picker.locator(".ui-datepicker-calendar").wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
 
-    return None
+    return found
 
 
-def check_once(site: Site) -> date | None:
-    """Run the full flow once for one site. Returns the next available date, if any."""
+def check_once(site: Site) -> list[date]:
+    """Run the full flow once for one site. Returns every available date
+    found (possibly empty)."""
     headless = not os.environ.get("SHOW_BROWSER")
 
     with sync_playwright() as p:
@@ -298,7 +320,7 @@ def check_once(site: Site) -> date | None:
             page = context.new_page()
             page.set_default_timeout(PAGE_TIMEOUT_MS)
             fill_booking_form(page, site)
-            return find_next_available_date(page)
+            return find_available_dates(page)
         finally:
             browser.close()
 
@@ -307,7 +329,7 @@ RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "1"))
 RETRY_DELAY_SECONDS = int(os.environ.get("RETRY_DELAY_SECONDS", "60"))
 
 
-def check_with_retry(site: Site) -> date | None:
+def check_with_retry(site: Site) -> list[date]:
     """Run check_once(site), retrying with a delay if the site fails to
     load or behaves unexpectedly (timeouts, missing elements, connection
     errors, etc). Raises only after all attempts are exhausted."""
@@ -338,13 +360,22 @@ def _record_check(site: Site, stamp: str, result: str) -> None:
     CHECK_HISTORY.setdefault(site.name, []).append({"stamp": stamp, "result": result})
 
 
+# Per-site set of qualifying dates we've already successfully alerted on
+# (Telegram AND email both went through). Once a date is in here, it
+# won't trigger another alert on a later cycle — avoids re-notifying
+# about the same open slot every 3 minutes. A genuinely *new* date
+# (e.g. another slot opens up) still alerts, since only that new date
+# is missing from the set.
+ALERTED_DATES: dict[str, set[date]] = {site.name: set() for site in SITES}
+
+
 def run_check_for_site(site: Site) -> None:
     """Single check-and-alert cycle for one site. Never raises — logs and
     swallows errors so a bad run doesn't kill the surrounding loop or the
     other sites. Retries a few times internally in case the site is
     temporarily down/flaky."""
     try:
-        next_date = check_with_retry(site)
+        available_dates = check_with_retry(site)
     except Exception as e:
         stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
         # Full console log (Playwright errors are multi-line and verbose —
@@ -357,42 +388,69 @@ def run_check_for_site(site: Site) -> None:
 
     stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
 
-    if next_date is None:
+    if not available_dates:
         print(f"[{stamp}] [{site.name}] No available appointment date found in the browsable range.")
         _record_check(site, stamp, "no available date found")
         return
 
-    print(f"[{stamp}] [{site.name}] Next available appointment date: {next_date.strftime('%d %B %Y')}")
-    _record_check(site, stamp, next_date.strftime("%d %B %Y"))
+    available_dates.sort()
+    dates_str = ", ".join(d.strftime("%d %B %Y") for d in available_dates)
+    print(f"[{stamp}] [{site.name}] Available appointment date(s): {dates_str}")
+    _record_check(site, stamp, dates_str)
 
-    if next_date <= CUTOFF_DATE:
-        telegram_msg = (
-            f"🎉 <b>APPOINTMENT AVAILABLE!</b> 🎉\n\n"
-            f"📍 <b>{_escape_html(site.name)}</b>\n"
-            f"📅 <b>{_escape_html(next_date.strftime('%d %B %Y'))}</b>\n"
-            f"⏰ On or before cutoff ({_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))})\n\n"
-            f"👉 <a href=\"{site.url}\">Book now</a> — slots fill fast!"
-        )
-        send_telegram_message(site, telegram_msg, html=True)
-        print(f"[{stamp}] [{site.name}] Telegram alert sent.")
-        email_msg = (
-            f"{site.name} OCI appointment available: "
-            f"{next_date.strftime('%d %B %Y')} (on/before {CUTOFF_DATE.strftime('%d %B %Y')})\n"
-            f"Book now: {site.url}"
-        )
-        send_email(
-            subject=f"{site.name} OCI appointment available — {next_date.strftime('%d %B %Y')}",
-            body=email_msg,
-        )
-        print(f"[{stamp}] [{site.name}] Email alert sent.")
-    else:
-        print(f"[{stamp}] [{site.name}] Earliest slot is after cutoff "
-              f"({CUTOFF_DATE.strftime('%d %B %Y')}) — no alert sent.")
+    qualifying = [d for d in available_dates if d <= CUTOFF_DATE]
+
+    if not qualifying:
+        print(f"[{stamp}] [{site.name}] Earliest slot ({available_dates[0].strftime('%d %B %Y')}) "
+              f"is after cutoff ({CUTOFF_DATE.strftime('%d %B %Y')}) — no alert sent.")
+        return
+
+    already_alerted = ALERTED_DATES.setdefault(site.name, set())
+    new_dates = [d for d in qualifying if d not in already_alerted]
+
+    if not new_dates:
+        print(f"[{stamp}] [{site.name}] {len(qualifying)} qualifying date(s), all already alerted — no repeat sent.")
+        return
+
+    date_lines = "\n".join(f"📅 <b>{_escape_html(d.strftime('%d %B %Y'))}</b>" for d in new_dates)
+    telegram_msg = (
+        f"🎉 <b>APPOINTMENT{'S' if len(new_dates) > 1 else ''} AVAILABLE!</b> 🎉\n\n"
+        f"📍 <b>{_escape_html(site.name)}</b>\n"
+        f"{date_lines}\n"
+        f"⏰ On or before cutoff ({_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))})\n\n"
+        f"👉 <a href=\"{site.url}\">Book now</a> — slots fill fast!"
+    )
+    telegram_ok = send_telegram_message(site, telegram_msg, html=True)
+    print(f"[{stamp}] [{site.name}] Telegram alert {'sent' if telegram_ok else 'FAILED'}.")
+
+    email_dates = ", ".join(d.strftime("%d %B %Y") for d in new_dates)
+    email_msg = (
+        f"{site.name} OCI appointment(s) available: "
+        f"{email_dates} (on/before {CUTOFF_DATE.strftime('%d %B %Y')})\n"
+        f"Book now: {site.url}"
+    )
+    email_ok = send_email(
+        subject=f"{site.name} OCI appointment(s) available — {email_dates}",
+        body=email_msg,
+    )
+    print(f"[{stamp}] [{site.name}] Email alert {'sent' if email_ok else 'FAILED'}.")
+
+    # Only mark dates as alerted once BOTH channels confirmed success —
+    # if either failed, we want to retry those dates next cycle rather
+    # than silently drop the notification.
+    if telegram_ok and email_ok:
+        already_alerted.update(new_dates)
 
 
 def run_check() -> None:
-    """Runs the check-and-alert cycle for every configured site."""
+    """Runs the check-and-alert cycle for every configured site still
+    within its stop_checking_after window."""
+    today = datetime.now(CET_ZONE).date()
     for site in SITES:
+        if site.stop_checking_after and today > site.stop_checking_after:
+            print(f"[{datetime.now(CET_ZONE).isoformat(timespec='seconds')}] [{site.name}] "
+                  f"Past stop date ({site.stop_checking_after.strftime('%d %B %Y')}) — skipping.")
+            continue
         run_check_for_site(site)
 
 
@@ -446,7 +504,10 @@ def maybe_send_heartbeat(last_heartbeat: float) -> float:
         return last_heartbeat
 
     stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
+    today = datetime.now(CET_ZONE).date()
     for site in SITES:
+        if site.stop_checking_after and today > site.stop_checking_after:
+            continue  # site has stopped running — no point heartbeating it
         send_telegram_message(site, _format_heartbeat(site, stamp), html=True)
         CHECK_HISTORY[site.name] = []  # reset for the next period
     print(f"[{stamp}] Heartbeat sent.")
@@ -454,7 +515,7 @@ def maybe_send_heartbeat(last_heartbeat: float) -> float:
 
 
 def main() -> None:
-    """Runs forever, checking every POLL_SECONDS (default 300s / 5min).
+    """Runs forever, checking every POLL_SECONDS (default 180s / 3min).
     Set RUN_ONCE=1 to run a single check and exit (useful for testing
     or if you want to drive the interval with an external scheduler
     instead).
@@ -467,7 +528,7 @@ def main() -> None:
     so you know the watcher is still running, independent of whether an
     appointment was found.
     """
-    poll_seconds = int(os.environ.get("POLL_SECONDS", "300"))
+    poll_seconds = int(os.environ.get("POLL_SECONDS", "180"))
 
     if os.environ.get("RUN_ONCE"):
         wait = seconds_until_blackout_ends()
