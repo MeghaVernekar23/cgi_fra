@@ -11,7 +11,7 @@ package interference, much more reliable on headless Linux servers.
 First-time setup after `uv sync` needs the browser binary once:
     uv run playwright install chromium --with-deps
 
-Runs forever by default, checking every 3 minutes (POLL_SECONDS env var
+Runs forever by default, checking every 5 minutes (POLL_SECONDS env var
 to change). Meant to run as a long-lived process on a server:
 
     uv run main.py
@@ -26,7 +26,7 @@ Show the browser window instead of headless (debugging):
 
 If a site fails to load / times out / behaves unexpectedly, that site is
 NOT retried within the same cycle by default (RETRY_ATTEMPTS=1) — it's
-logged and skipped, and the next POLL_SECONDS tick (default 3 min) picks
+logged and skipped, and the next POLL_SECONDS tick (default 5 min) picks
 it back up naturally. Set RETRY_ATTEMPTS higher to retry in-cycle first,
 waiting RETRY_DELAY_SECONDS (default 60s) between tries.
 
@@ -405,7 +405,7 @@ def _record_check(site: Site, stamp: str, result: str) -> None:
 # Per-site set of qualifying dates we've already successfully alerted on
 # (Telegram AND email both went through). Once a date is in here, it
 # won't trigger another alert on a later cycle — avoids re-notifying
-# about the same open slot every 3 minutes. A genuinely *new* date
+# about the same open slot every poll cycle. A genuinely *new* date
 # (e.g. another slot opens up) still alerts, since only that new date
 # is missing from the set.
 ALERTED_DATES: dict[str, set[date]] = {site.name: set() for site in SITES}
@@ -469,34 +469,13 @@ def run_check_for_site(site: Site) -> None:
         )
         mark_as_alerted = new_dates
     else:
-        # 0 or 1 dates within cutoff — nothing worth an urgent "book now"
-        # push. Instead send the single earliest date found overall
-        # (which may be past the cutoff) purely as informational: "here's
-        # when the next slot currently is."
+        # 0 or 1 dates within cutoff — not enough to page an alert.
+        # Informational-earliest-date pings were tried and disabled
+        # (too noisy for dates far past cutoff) — log only, no send.
         earliest = available_dates[0]
-        if earliest in already_alerted:
-            print(f"[{stamp}] [{site.name}] Earliest slot ({earliest.strftime('%d %B %Y')}) "
-                  f"already sent as info — no repeat sent.")
-            return
-
-        if earliest > CUTOFF_DATE:
-            note = (f"(Informational only — this is after the "
-                     f"{_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))} cutoff, so no urgent action needed.)")
-        else:
-            note = "(Within cutoff, but only one slot found — for reference.)"
-        telegram_msg = (
-            f"ℹ️ <b>{_escape_html(site.name)}</b> — earliest available appointment\n\n"
-            f"📅 <b>{_escape_html(earliest.strftime('%d %B %Y'))}</b>\n"
-            f"{note}"
-        )
-        email_subject = f"{site.name} — earliest available appointment: {earliest.strftime('%d %B %Y')}"
-        email_msg = (
-            f"{site.name} earliest available appointment (informational): "
-            f"{earliest.strftime('%d %B %Y')}\n"
-            f"Cutoff: {CUTOFF_DATE.strftime('%d %B %Y')}\n"
-            f"More info: {site.url}"
-        )
-        mark_as_alerted = [earliest]
+        print(f"[{stamp}] [{site.name}] Only {len(qualifying)} qualifying date(s) within cutoff "
+              f"(earliest overall: {earliest.strftime('%d %B %Y')}) — no alert sent.")
+        return
 
     telegram_ok = send_telegram_message(site, telegram_msg, html=True)
     print(f"[{stamp}] [{site.name}] Telegram alert {'sent' if telegram_ok else 'FAILED'}.")
@@ -764,7 +743,7 @@ def maybe_run_mportal_check(last_mportal_check: float) -> float:
 
 
 def main() -> None:
-    """Runs forever, checking every POLL_SECONDS (default 180s / 3min).
+    """Runs forever, checking every POLL_SECONDS (default 300s / 5min).
     Set RUN_ONCE=1 to run a single check and exit (useful for testing
     or if you want to drive the interval with an external scheduler
     instead).
@@ -782,7 +761,7 @@ def main() -> None:
     cadence than the appointment sites, since status rarely changes and
     logging in is heavier than a simple page check.
     """
-    poll_seconds = int(os.environ.get("POLL_SECONDS", "180"))
+    poll_seconds = int(os.environ.get("POLL_SECONDS", "300"))
 
     if os.environ.get("RUN_ONCE"):
         wait = seconds_until_blackout_ends()
