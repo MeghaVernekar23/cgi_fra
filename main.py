@@ -49,7 +49,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 load_dotenv()
 
-CUTOFF_DATE = date(2026, 9, 29)
+CUTOFF_DATE = date(2026, 10, 15)
 
 # Don't hit the sites during this local window — likely the platform's own
 # maintenance window, so it's especially flaky/likely to be down then.
@@ -90,6 +90,9 @@ class Site:
     # After this local (CET) date, the watcher stops actively checking
     # this site at all (skipped every cycle) — None means no expiry.
     stop_checking_after: date | None = None
+    # Manual on/off switch — set False to fully disable a site (skipped
+    # every cycle and in heartbeats) regardless of stop_checking_after.
+    enabled: bool = True
 
 
 SITES = [
@@ -112,8 +115,47 @@ SITES = [
         telegram_bot=os.environ.get("TELEGRAM_BERLIN_BOT"),
         telegram_chat_ids=_parse_chat_ids(os.environ.get("TELEGRAM_BERLIN_BOT_USERS")),
         stop_checking_after=date(2026, 9, 5),
+        enabled=False,  # disabled for now — re-enable by flipping this back to True
     ),
 ]
+
+
+# --- mPortal (passportindia.gov.in) Surrender Certificate status tracker ---
+# Separate from the appointment-booking sites above: this logs into the
+# user's own mPortal account and checks "Track Application Status" for
+# each Surrender Certificate application, alerting only when a status
+# actually changes. Runs on its own MPORTAL_POLL_SECONDS cadence
+# (default 30 min), independent of the 3-min appointment poll loop.
+MPORTAL_URL = os.environ.get("MPORTAL_WEBSITE", "https://mportal.passportindia.gov.in/gpsp/AuthNavigation/Login")
+MPORTAL_USERID = os.environ.get("MPORTAL_USERID")
+MPORTAL_PASSWORD = os.environ.get("MPORTAL_PASSWORD")
+MPORTAL_HOME_URL = "https://mportal.passportindia.gov.in/gpsp/MainNavigation/Home"
+
+# Application Reference Numbers to track, with the last known status.
+# Statuses are seeded with what was already confirmed manually — the
+# watcher only alerts on a *change* from these baselines, not on the
+# first check after startup.
+MPORTAL_APPLICATIONS = {
+    "26-2004411209": "Surrender Certificate application form has been submitted.",
+    "26-2004253057": "Surrender Certificate application form has been submitted.",
+    "26-2004235605": "Surrender Certificate application form has been submitted.",
+    "26-2000021832": "Surrender Certificate application form has been submitted.",
+}
+
+# In-memory last-known-status per ARN, seeded from MPORTAL_APPLICATIONS
+# above. Updated whenever a check finds a (confirmed, alerted) change.
+MPORTAL_LAST_STATUS: dict[str, str] = dict(MPORTAL_APPLICATIONS)
+
+# No dedicated mPortal Telegram bot exists — reuse the main (Frankfurt)
+# bot/chat, wrapped in its own Site so send_telegram_message has a name
+# to log against and isn't silently tied to SITES[0]'s position.
+MPORTAL_TELEGRAM_SITE = Site(
+    name="mPortal",
+    url=MPORTAL_HOME_URL,
+    state_value="",
+    telegram_bot=os.environ.get("TELEGRAM_BOT"),
+    telegram_chat_ids=_parse_chat_ids(os.environ.get("TELEGRAM_CHAT_ID")),
+)
 
 
 def send_email(subject: str, body: str) -> bool:
@@ -399,54 +441,245 @@ def run_check_for_site(site: Site) -> None:
     _record_check(site, stamp, dates_str)
 
     qualifying = [d for d in available_dates if d <= CUTOFF_DATE]
-
-    if not qualifying:
-        print(f"[{stamp}] [{site.name}] Earliest slot ({available_dates[0].strftime('%d %B %Y')}) "
-              f"is after cutoff ({CUTOFF_DATE.strftime('%d %B %Y')}) — no alert sent.")
-        return
-
     already_alerted = ALERTED_DATES.setdefault(site.name, set())
-    new_dates = [d for d in qualifying if d not in already_alerted]
 
-    if not new_dates:
-        print(f"[{stamp}] [{site.name}] {len(qualifying)} qualifying date(s), all already alerted — no repeat sent.")
-        return
+    if len(qualifying) >= 2:
+        # Multiple real openings within the cutoff — list all of them,
+        # full urgency framing.
+        new_dates = [d for d in qualifying if d not in already_alerted]
+        if not new_dates:
+            print(f"[{stamp}] [{site.name}] {len(qualifying)} qualifying date(s), "
+                  f"all already alerted — no repeat sent.")
+            return
 
-    date_lines = "\n".join(f"📅 <b>{_escape_html(d.strftime('%d %B %Y'))}</b>" for d in new_dates)
-    telegram_msg = (
-        f"🎉 <b>APPOINTMENT{'S' if len(new_dates) > 1 else ''} AVAILABLE!</b> 🎉\n\n"
-        f"📍 <b>{_escape_html(site.name)}</b>\n"
-        f"{date_lines}\n"
-        f"⏰ On or before cutoff ({_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))})\n\n"
-        f"👉 <a href=\"{site.url}\">Book now</a> — slots fill fast!"
-    )
+        date_lines = "\n".join(f"📅 <b>{_escape_html(d.strftime('%d %B %Y'))}</b>" for d in new_dates)
+        telegram_msg = (
+            f"🎉 <b>APPOINTMENT{'S' if len(new_dates) > 1 else ''} AVAILABLE!</b> 🎉\n\n"
+            f"📍 <b>{_escape_html(site.name)}</b>\n"
+            f"{date_lines}\n"
+            f"⏰ On or before cutoff ({_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))})\n\n"
+            f"👉 <a href=\"{site.url}\">Book now</a> — slots fill fast!"
+        )
+        email_dates = ", ".join(d.strftime("%d %B %Y") for d in new_dates)
+        email_subject = f"{site.name} OCI appointment(s) available — {email_dates}"
+        email_msg = (
+            f"{site.name} OCI appointment(s) available: "
+            f"{email_dates} (on/before {CUTOFF_DATE.strftime('%d %B %Y')})\n"
+            f"Book now: {site.url}"
+        )
+        mark_as_alerted = new_dates
+    else:
+        # 0 or 1 dates within cutoff — nothing worth an urgent "book now"
+        # push. Instead send the single earliest date found overall
+        # (which may be past the cutoff) purely as informational: "here's
+        # when the next slot currently is."
+        earliest = available_dates[0]
+        if earliest in already_alerted:
+            print(f"[{stamp}] [{site.name}] Earliest slot ({earliest.strftime('%d %B %Y')}) "
+                  f"already sent as info — no repeat sent.")
+            return
+
+        if earliest > CUTOFF_DATE:
+            note = (f"(Informational only — this is after the "
+                     f"{_escape_html(CUTOFF_DATE.strftime('%d %B %Y'))} cutoff, so no urgent action needed.)")
+        else:
+            note = "(Within cutoff, but only one slot found — for reference.)"
+        telegram_msg = (
+            f"ℹ️ <b>{_escape_html(site.name)}</b> — earliest available appointment\n\n"
+            f"📅 <b>{_escape_html(earliest.strftime('%d %B %Y'))}</b>\n"
+            f"{note}"
+        )
+        email_subject = f"{site.name} — earliest available appointment: {earliest.strftime('%d %B %Y')}"
+        email_msg = (
+            f"{site.name} earliest available appointment (informational): "
+            f"{earliest.strftime('%d %B %Y')}\n"
+            f"Cutoff: {CUTOFF_DATE.strftime('%d %B %Y')}\n"
+            f"More info: {site.url}"
+        )
+        mark_as_alerted = [earliest]
+
     telegram_ok = send_telegram_message(site, telegram_msg, html=True)
     print(f"[{stamp}] [{site.name}] Telegram alert {'sent' if telegram_ok else 'FAILED'}.")
 
-    email_dates = ", ".join(d.strftime("%d %B %Y") for d in new_dates)
-    email_msg = (
-        f"{site.name} OCI appointment(s) available: "
-        f"{email_dates} (on/before {CUTOFF_DATE.strftime('%d %B %Y')})\n"
-        f"Book now: {site.url}"
-    )
-    email_ok = send_email(
-        subject=f"{site.name} OCI appointment(s) available — {email_dates}",
-        body=email_msg,
-    )
+    email_ok = send_email(subject=email_subject, body=email_msg)
     print(f"[{stamp}] [{site.name}] Email alert {'sent' if email_ok else 'FAILED'}.")
 
     # Only mark dates as alerted once BOTH channels confirmed success —
-    # if either failed, we want to retry those dates next cycle rather
-    # than silently drop the notification.
+    # if either failed, we want to retry next cycle rather than silently
+    # drop the notification.
     if telegram_ok and email_ok:
-        already_alerted.update(new_dates)
+        already_alerted.update(mark_as_alerted)
+
+
+def _mportal_login(page) -> None:
+    page.goto(MPORTAL_URL, timeout=PAGE_TIMEOUT_MS)
+    page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+    page.get_by_placeholder("User ID*").fill(MPORTAL_USERID)
+    page.get_by_placeholder("Password*").fill(MPORTAL_PASSWORD)
+    page.get_by_text("Login", exact=True).last.click()
+    page.wait_for_url("**/MainNavigation/Home", timeout=PAGE_TIMEOUT_MS)
+    page.wait_for_timeout(1500)  # let the submitted-applications table settle
+
+
+def _mportal_track_status(page, arn: str) -> str:
+    """Opens the More Actions menu for the row matching `arn` and reads
+    back the "Application Status" value from the tracker dialog. Site is
+    React Native Web (no real <table>/<button> markup, duplicate ids), so
+    rows are matched by vertical position instead of a DOM relationship."""
+    arn_locator = page.get_by_text(arn, exact=False).first
+    arn_box = arn_locator.bounding_box()
+    if not arn_box:
+        raise RuntimeError(f"ARN {arn} not found on mPortal home page — application list may have changed.")
+
+    more_buttons = page.locator("div[data-focusable='true'][tabindex='0']")
+    best = None
+    best_dy = float("inf")
+    row_center_y = arn_box["y"] + arn_box["height"] / 2
+    for i in range(more_buttons.count()):
+        box = more_buttons.nth(i).bounding_box()
+        if not box or box["x"] <= 1300:  # "More Actions" column is far right
+            continue
+        dy = abs((box["y"] + box["height"] / 2) - row_center_y)
+        if dy < best_dy:
+            best_dy = dy
+            best = more_buttons.nth(i)
+    if best is None:
+        raise RuntimeError(f"Could not find 'More Actions' button for ARN {arn}.")
+
+    best.click()
+    page.get_by_text("Track Application Status", exact=True).click(timeout=PAGE_TIMEOUT_MS)
+
+    # The dialog opens and populates its content asynchronously — give it
+    # a moment to fully render before reading (a plain wait_for on the
+    # "Close" button's visibility isn't enough: the button can be visible
+    # and stable before the ARN/status text nodes next to it finish
+    # rendering, which was silently producing truncated/wrong reads).
+    page.wait_for_timeout(2000)
+
+    close_btn = page.get_by_text("Close", exact=True)
+    close_btn.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+
+    def _dialog_text() -> str:
+        dialog = close_btn.locator("..").locator("..").locator("..")
+        return dialog.inner_text()
+
+    deadline = time.monotonic() + (PAGE_TIMEOUT_MS / 1000)
+    full_text = ""
+    while time.monotonic() < deadline:
+        full_text = _dialog_text()
+        if arn in full_text:
+            break
+        page.wait_for_timeout(300)
+    else:
+        raise RuntimeError(f"Track Application Status dialog for {arn} never rendered "
+                            f"the expected content in time (last seen: {full_text!r}).")
+
+    # full_text looks like:
+    #   Application Reference Number\n-\n<arn>\nApplicant Name\n-\n<name>\nApplication Status\n-\n<status>\nClose
+    # Pull out the line right after the last "Application Status" / "-" pair.
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    status = None
+    for i, line in enumerate(lines):
+        if line == "Application Status" and i + 2 < len(lines) and lines[i + 1] == "-":
+            status = lines[i + 2]
+    if status is None:
+        raise RuntimeError(f"Could not parse status text for ARN {arn}: {full_text!r}")
+
+    close_btn.click()
+    page.wait_for_timeout(500)
+    return status
+
+
+def check_mportal_statuses() -> dict[str, str]:
+    """Logs into mPortal once and reads the current status for every
+    tracked ARN. Returns {arn: status}. Raises on login failure or if
+    the page structure doesn't match what we expect (caller handles
+    retry/logging, same pattern as the appointment sites)."""
+    if not MPORTAL_USERID or not MPORTAL_PASSWORD:
+        raise RuntimeError("MPORTAL_USERID / MPORTAL_PASSWORD not set in .env")
+
+    headless = not os.environ.get("SHOW_BROWSER")
+    results: dict[str, str] = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--no-sandbox", "--disable-dev-shm-usage"] if headless else [],
+        )
+        try:
+            context = browser.new_context(viewport={"width": 1600, "height": 1000})
+            page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT_MS)
+            _mportal_login(page)
+
+            for arn in MPORTAL_APPLICATIONS:
+                results[arn] = _mportal_track_status(page, arn)
+                # Track Application Status navigates away from Home;
+                # go back before processing the next ARN.
+                page.goto(MPORTAL_HOME_URL, timeout=PAGE_TIMEOUT_MS)
+                page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+                page.wait_for_timeout(1000)
+        finally:
+            browser.close()
+
+    return results
+
+
+def run_mportal_check() -> None:
+    """Single mPortal check-and-alert cycle. Never raises.
+
+    Every cycle sends a short Telegram ping either way (so you know it
+    ran), but only sends the "status changed" Telegram + email when an
+    application's status actually differs from MPORTAL_LAST_STATUS —
+    no long per-application list on the routine no-change case."""
+    stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
+    try:
+        current = check_mportal_statuses()
+    except Exception as e:
+        print(f"[{stamp}] [mPortal] Check failed: {e}")
+        return
+
+    changes = {arn: status for arn, status in current.items()
+               if MPORTAL_LAST_STATUS.get(arn) != status}
+
+    if not changes:
+        print(f"[{stamp}] [mPortal] Checked {len(current)} application(s) — no status changes.")
+        send_telegram_message(
+            MPORTAL_TELEGRAM_SITE,
+            f"✅ mPortal: no status change for any of the {len(current)} Surrender Certificate application(s).",
+        )
+        return
+
+    for arn, new_status in changes.items():
+        old_status = MPORTAL_LAST_STATUS.get(arn, "(unknown)")
+        print(f"[{stamp}] [mPortal] {arn} status changed: {old_status!r} -> {new_status!r}")
+
+    telegram_ok = send_telegram_message(MPORTAL_TELEGRAM_SITE, "Surrender certificate status changed")
+    print(f"[{stamp}] [mPortal] Telegram alert {'sent' if telegram_ok else 'FAILED'}.")
+
+    email_body = "\n\n".join(
+        f"{arn}\nOld: {MPORTAL_LAST_STATUS.get(arn, '(unknown)')}\nNew: {status}"
+        for arn, status in changes.items()
+    )
+    email_ok = send_email(
+        subject=f"Passport application status update ({len(changes)} change(s))",
+        body=email_body,
+    )
+    print(f"[{stamp}] [mPortal] Email alert {'sent' if email_ok else 'FAILED'}.")
+
+    # Only advance the baseline once both channels confirmed — same
+    # "don't silently drop a notification" rule as the appointment sites.
+    if telegram_ok and email_ok:
+        MPORTAL_LAST_STATUS.update(changes)
 
 
 def run_check() -> None:
-    """Runs the check-and-alert cycle for every configured site still
-    within its stop_checking_after window."""
+    """Runs the check-and-alert cycle for every configured site that's
+    enabled and still within its stop_checking_after window."""
     today = datetime.now(CET_ZONE).date()
     for site in SITES:
+        if not site.enabled:
+            continue  # manually disabled — skip silently every cycle
         if site.stop_checking_after and today > site.stop_checking_after:
             print(f"[{datetime.now(CET_ZONE).isoformat(timespec='seconds')}] [{site.name}] "
                   f"Past stop date ({site.stop_checking_after.strftime('%d %B %Y')}) — skipping.")
@@ -506,11 +739,27 @@ def maybe_send_heartbeat(last_heartbeat: float) -> float:
     stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
     today = datetime.now(CET_ZONE).date()
     for site in SITES:
+        if not site.enabled:
+            continue  # manually disabled
         if site.stop_checking_after and today > site.stop_checking_after:
             continue  # site has stopped running — no point heartbeating it
         send_telegram_message(site, _format_heartbeat(site, stamp), html=True)
         CHECK_HISTORY[site.name] = []  # reset for the next period
     print(f"[{stamp}] Heartbeat sent.")
+    return now
+
+
+MPORTAL_POLL_SECONDS = int(os.environ.get("MPORTAL_POLL_SECONDS", str(30 * 60)))  # 30 min
+
+
+def maybe_run_mportal_check(last_mportal_check: float) -> float:
+    """Runs the mPortal status check if MPORTAL_POLL_SECONDS have elapsed
+    since the last one. Returns the (possibly updated) last-run timestamp
+    (time.monotonic())."""
+    now = time.monotonic()
+    if now - last_mportal_check < MPORTAL_POLL_SECONDS:
+        return last_mportal_check
+    run_mportal_check()
     return now
 
 
@@ -527,6 +776,11 @@ def main() -> None:
     Sends a Telegram heartbeat every HEARTBEAT_SECONDS (default 1 hour)
     so you know the watcher is still running, independent of whether an
     appointment was found.
+
+    Separately, checks mPortal Surrender Certificate application status
+    every MPORTAL_POLL_SECONDS (default 30 min) — a different, slower
+    cadence than the appointment sites, since status rarely changes and
+    logging in is heavier than a simple page check.
     """
     poll_seconds = int(os.environ.get("POLL_SECONDS", "180"))
 
@@ -534,15 +788,19 @@ def main() -> None:
         wait = seconds_until_blackout_ends()
         if wait > 0:
             print(f"In blackout window ({BLACKOUT_START_HOUR}-{BLACKOUT_END_HOUR} CEST) — skipping this run.")
-            return
-        run_check()
+        else:
+            run_check()
+        run_mportal_check()
         return
 
     print(f"Starting watcher loop: checking every {poll_seconds}s, "
-          f"heartbeat every {HEARTBEAT_SECONDS}s. Ctrl+C to stop.")
+          f"heartbeat every {HEARTBEAT_SECONDS}s, "
+          f"mPortal status every {MPORTAL_POLL_SECONDS}s. Ctrl+C to stop.")
     last_heartbeat = 0.0  # forces an immediate heartbeat on first loop
+    last_mportal_check = 0.0  # forces an immediate mPortal check on first loop
     while True:
         last_heartbeat = maybe_send_heartbeat(last_heartbeat)
+        last_mportal_check = maybe_run_mportal_check(last_mportal_check)
 
         wait = seconds_until_blackout_ends()
         if wait > 0:
