@@ -679,6 +679,20 @@ def seconds_until_blackout_ends() -> float:
     return (end - now).total_seconds()
 
 
+# mPortal has its own, wider blackout window — 19:00 CEST to 04:00 CEST
+# (crosses midnight), separate from the appointment sites' 1-4AM window.
+MPORTAL_BLACKOUT_START_HOUR = 19  # 7 PM CEST
+MPORTAL_BLACKOUT_END_HOUR = 4  # 4 AM CEST
+
+
+def in_mportal_blackout() -> bool:
+    """True if we're currently within the 19:00-04:00 CEST mPortal
+    blackout window. Handles the midnight-crossing range directly
+    (unlike seconds_until_blackout_ends's same-day range)."""
+    hour = datetime.now(CET_ZONE).hour
+    return hour >= MPORTAL_BLACKOUT_START_HOUR or hour < MPORTAL_BLACKOUT_END_HOUR
+
+
 HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", str(60 * 60)))  # 1 hour
 
 
@@ -733,11 +747,17 @@ MPORTAL_POLL_SECONDS = int(os.environ.get("MPORTAL_POLL_SECONDS", str(30 * 60)))
 
 def maybe_run_mportal_check(last_mportal_check: float) -> float:
     """Runs the mPortal status check if MPORTAL_POLL_SECONDS have elapsed
-    since the last one. Returns the (possibly updated) last-run timestamp
-    (time.monotonic())."""
+    since the last one, unless we're inside the 19:00-04:00 CEST mPortal
+    blackout window (paused, no check/alert during that time). Returns
+    the (possibly updated) last-run timestamp (time.monotonic())."""
     now = time.monotonic()
     if now - last_mportal_check < MPORTAL_POLL_SECONDS:
         return last_mportal_check
+    if in_mportal_blackout():
+        stamp = datetime.now(CET_ZONE).isoformat(timespec="seconds")
+        print(f"[{stamp}] [mPortal] In blackout window "
+              f"({MPORTAL_BLACKOUT_START_HOUR}:00-0{MPORTAL_BLACKOUT_END_HOUR}:00 CEST) — skipping check.")
+        return now  # still advance the timer so we don't check again until the next interval
     run_mportal_check()
     return now
 
