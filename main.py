@@ -633,7 +633,12 @@ def run_mportal_check() -> None:
         old_status = MPORTAL_LAST_STATUS.get(arn, "(unknown)")
         print(f"[{stamp}] [mPortal] {arn} status changed: {old_status!r} -> {new_status!r}")
 
-    telegram_ok = send_telegram_message(MPORTAL_TELEGRAM_SITE, "Surrender certificate status changed")
+    change_lines = "\n\n".join(
+        f"📄 {arn}\nOld: {MPORTAL_LAST_STATUS.get(arn, '(unknown)')}\nNew: {status}"
+        for arn, status in changes.items()
+    )
+    telegram_text = f"Surrender certificate status changed\n\n{change_lines}"
+    telegram_ok = send_telegram_message(MPORTAL_TELEGRAM_SITE, telegram_text)
     print(f"[{stamp}] [mPortal] Telegram alert {'sent' if telegram_ok else 'FAILED'}.")
 
     email_body = "\n\n".join(
